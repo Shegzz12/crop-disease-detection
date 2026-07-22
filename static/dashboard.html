@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Field Scanner — Maize Disease & Pest Watch</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --gold:#E8B23D;
+    --gold-dark:#8A5F14;
+    --gold-tint:#FBF0D9;
+    --leaf:#35502B;
+    --leaf-tint:#E7EEE1;
+    --rust:#A93B2E;
+    --rust-tint:#F6E3DF;
+    --amber:#B8801A;
+    --amber-tint:#FBEBD0;
+    --soil:#241C13;
+    --soil-soft:#5B4F3E;
+    --cream:#FAF6EC;
+    --paper:#FFFFFF;
+    --line:#E4DBC6;
+    --line-strong:#D2C6A8;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--cream);color:var(--soil);font-family:'Inter',sans-serif;-webkit-font-smoothing:antialiased;}
+  .wrap{max-width:1000px;margin:0 auto;padding:2.5rem 1.5rem 4rem;}
+
+  header.top{display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:2rem;flex-wrap:wrap;gap:1rem;}
+  .brand-mark{display:flex;align-items:center;gap:12px;}
+  h1{font-family:'Fraunces',serif;font-optical-sizing:auto;font-weight:600;font-size:28px;margin:0 0 2px;letter-spacing:-0.01em;}
+  .subtitle{font-size:13px;color:var(--soil-soft);margin:0;}
+  .stamp{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--soil-soft);border:1px solid var(--line-strong);border-radius:20px;padding:5px 12px;white-space:nowrap;}
+
+  .panel{background:var(--paper);border:1px solid var(--line);border-radius:14px;padding:1.5rem;margin-bottom:1.5rem;}
+  .panel h2{font-family:'Fraunces',serif;font-weight:500;font-size:16px;margin:0 0 1rem;}
+  .field-label{font-size:12px;color:var(--soil-soft);font-weight:500;display:block;margin-bottom:6px;}
+  input[type=text]{width:100%;padding:9px 12px;border:1px solid var(--line-strong);border-radius:8px;font-family:'IBM Plex Mono',monospace;font-size:12px;background:var(--cream);color:var(--soil);}
+  input[type=text]:focus{outline:2px solid var(--gold);outline-offset:1px;}
+  .config-row{display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap;}
+  .config-row .field-block{width:360px;max-width:100%;}
+  .live-status{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--soil-soft);}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--line-strong);}
+  .dot.live{background:var(--leaf);box-shadow:0 0 0 3px var(--leaf-tint);}
+
+  .pest-banner{display:none;align-items:center;gap:14px;padding:1rem 1.25rem;border-radius:12px;background:var(--amber-tint);border:1px solid var(--amber);margin-bottom:1.5rem;}
+  .pest-banner.show{display:flex;}
+  .pest-banner .icon{font-size:22px;color:var(--amber);flex-shrink:0;}
+  .pest-banner .title{font-family:'Fraunces',serif;font-weight:600;font-size:16px;margin:0 0 4px;color:var(--amber);}
+  .pest-banner ul{margin:0;padding-left:18px;font-size:12px;color:var(--soil-soft);}
+
+  .sensor-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:1.5rem;}
+  @media (max-width:680px){.sensor-grid{grid-template-columns:1fr;}}
+  .sensor-card{border-radius:12px;padding:1rem;border:1px solid var(--line);background:var(--paper);}
+  .sensor-card.flag{background:var(--amber-tint);border-color:var(--amber);}
+  .sensor-card .s-label{font-size:11px;color:var(--soil-soft);text-transform:uppercase;letter-spacing:0.05em;font-family:'IBM Plex Mono',monospace;}
+  .sensor-card .s-value{font-family:'Fraunces',serif;font-weight:600;font-size:26px;margin:4px 0 2px;}
+  .sensor-card .s-note{font-size:11px;color:var(--soil-soft);}
+
+  .scan-grid{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem;}
+  @media (max-width:680px){.scan-grid{grid-template-columns:1fr;}}
+
+  .dropzone{border:1.5px dashed var(--line-strong);border-radius:12px;min-height:220px;display:flex;align-items:center;justify-content:center;text-align:center;cursor:pointer;position:relative;overflow:hidden;background:var(--gold-tint);}
+  .dropzone.drag{border-color:var(--gold-dark);}
+  .dropzone img{width:100%;height:100%;object-fit:cover;position:absolute;inset:0;}
+  .dropzone .prompt{position:relative;z-index:1;padding:1.5rem;color:var(--gold-dark);}
+  .dropzone .prompt p{margin:0;font-size:13px;font-weight:500;}
+  .scan-line{position:absolute;left:0;right:0;height:3px;background:var(--gold);box-shadow:0 0 8px 1px rgba(232,178,61,0.6);top:0;display:none;}
+  .scan-line.active{display:block;animation:sweep 1.4s ease-in-out infinite;}
+  @keyframes sweep{0%{top:0;}50%{top:calc(100% - 3px);}100%{top:0;}}
+
+  .specimen{flex:1;border-radius:12px;padding:1.25rem;background:var(--leaf-tint);border:1px solid var(--line);position:relative;display:flex;flex-direction:column;justify-content:center;min-height:220px;}
+  .specimen.status-alert{background:var(--rust-tint);}
+  .specimen .eyebrow{font-family:'IBM Plex Mono',monospace;font-size:11px;text-transform:uppercase;letter-spacing:0.06em;color:var(--soil-soft);margin-bottom:6px;}
+  .specimen .disease-name{font-family:'Fraunces',serif;font-weight:600;font-size:26px;color:var(--leaf);margin:0 0 8px;}
+  .specimen.status-alert .disease-name{color:var(--rust);}
+  .specimen .confidence{font-family:'IBM Plex Mono',monospace;font-size:14px;color:var(--soil-soft);}
+  .specimen .confidence b{color:var(--soil);font-size:16px;}
+  .ribbon{display:inline-flex;align-items:center;gap:6px;font-family:'IBM Plex Mono',monospace;font-size:11px;font-weight:500;letter-spacing:0.04em;padding:4px 10px;border-radius:20px;background:var(--leaf);color:#fff;width:fit-content;margin-top:12px;}
+  .specimen.status-alert .ribbon{background:var(--rust);}
+  .specimen .empty{color:var(--soil-soft);font-size:13px;}
+
+  button.scan-btn{width:100%;padding:12px;border:none;border-radius:8px;background:var(--soil);color:#fff;font-family:'Inter',sans-serif;font-weight:600;font-size:14px;cursor:pointer;}
+  button.scan-btn:disabled{background:var(--line-strong);color:var(--soil-soft);cursor:not-allowed;}
+  button.scan-btn:not(:disabled):hover{background:#3a2d1a;}
+  .error-msg{color:var(--rust);font-size:12px;margin-top:8px;font-family:'IBM Plex Mono',monospace;}
+
+  .tally{display:flex;gap:10px;flex-wrap:wrap;margin-top:0.25rem;}
+  .tally-chip{font-family:'IBM Plex Mono',monospace;font-size:11px;padding:5px 10px;border-radius:20px;background:var(--cream);border:1px solid var(--line-strong);color:var(--soil-soft);}
+  .tally-chip b{color:var(--soil);}
+
+  .log-row{display:grid;grid-template-columns:44px 1.4fr 1fr auto auto;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--line);font-size:13px;}
+  .log-row:last-child{border-bottom:none;}
+  .log-thumb{width:44px;height:44px;border-radius:8px;object-fit:cover;background:var(--line);}
+  .log-disease{font-weight:600;}
+  .log-time{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--soil-soft);}
+  .log-sensors{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--soil-soft);}
+  .log-chip{font-family:'IBM Plex Mono',monospace;font-size:10px;padding:3px 8px;border-radius:20px;color:#fff;background:var(--leaf);white-space:nowrap;}
+  .log-chip.alert{background:var(--rust);}
+  .log-chip.pest{background:var(--amber);}
+  .log-empty{color:var(--soil-soft);font-size:13px;text-align:center;padding:1.5rem 0;}
+  .panel-head-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem;flex-wrap:wrap;gap:8px;}
+  .clear-link{font-size:12px;color:var(--soil-soft);background:none;border:none;cursor:pointer;text-decoration:underline;font-family:'Inter',sans-serif;}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="top">
+    <div class="brand-mark">
+      <svg width="34" height="34" viewBox="0 0 34 34" fill="none">
+        <circle cx="17" cy="17" r="16" fill="#E8B23D"/>
+        <path d="M17 6c3 4 3 9 0 12-3-3-3-8 0-12z" fill="#35502B"/>
+        <path d="M17 12c2.5 3 2.5 7 0 10-2.5-3-2.5-7 0-10z" fill="#8A5F14"/>
+      </svg>
+      <div>
+        <h1>Field scanner</h1>
+        <p class="subtitle">Maize disease &amp; pest-risk watch</p>
+      </div>
+    </div>
+    <div class="stamp">blight &middot; rust &middot; gray leaf spot &middot; healthy</div>
+  </header>
+
+  <div class="panel">
+    <div class="panel-head-row">
+      <h2 style="margin:0;">API server</h2>
+      <div class="live-status"><span class="dot" id="liveDot"></span><span id="liveText">Not connected</span></div>
+    </div>
+    <div class="config-row">
+      <div class="field-block">
+        <span class="field-label">Server base URL (no trailing slash)</span>
+        <input type="text" id="apiBase" placeholder="https://crop-pest-detection.onrender.com" value="https://crop-pest-detection.onrender.com">
+      </div>
+    </div>
+  </div>
+
+  <div class="pest-banner" id="pestBanner">
+    <div class="icon">&#9888;</div>
+    <div>
+      <p class="title">Conditions favor pest activity</p>
+      <ul id="pestReasons"></ul>
+    </div>
+  </div>
+
+  <div class="sensor-grid">
+    <div class="sensor-card" id="tempCard">
+      <div class="s-label">Temperature</div>
+      <div class="s-value" id="tempValue">&mdash;</div>
+      <div class="s-note">Pest-favorable: 24&ndash;32&deg;C</div>
+    </div>
+    <div class="sensor-card" id="humidityCard">
+      <div class="s-label">Humidity</div>
+      <div class="s-value" id="humidityValue">&mdash;</div>
+      <div class="s-note">Pest-favorable: &ge; 60% RH</div>
+    </div>
+    <div class="sensor-card" id="gasCard">
+      <div class="s-label">Gas reading</div>
+      <div class="s-value" id="gasValue">&mdash;</div>
+      <div class="s-note">Flag above 1027 (calibrate to your sensor)</div>
+    </div>
+  </div>
+
+  <div class="scan-grid">
+    <div class="panel" style="margin-bottom:0;">
+      <h2>Latest camera frame</h2>
+      <div class="dropzone" id="dropzone">
+        <div class="scan-line" id="scanLine"></div>
+        <div class="prompt" id="dzPrompt">
+          <p>Waiting for a frame from the ESP32-CAM — or drop a photo here to test manually.</p>
+        </div>
+        <img id="preview" style="display:none;">
+      </div>
+      <input type="file" id="fileInput" accept="image/*" style="display:none;">
+      <div style="margin-top:1rem;">
+        <button class="scan-btn" id="scanBtn" disabled>Choose a photo to test manually</button>
+      </div>
+      <div class="error-msg" id="errorMsg"></div>
+    </div>
+
+    <div class="panel" style="margin-bottom:0;display:flex;">
+      <div style="width:100%;">
+        <h2>Diagnosis</h2>
+        <div class="specimen" id="specimen">
+          <p class="empty">No reading yet.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-top:1.5rem;">
+    <div class="panel-head-row">
+      <h2 style="margin:0;">Field log</h2>
+      <button class="clear-link" id="clearLog">Clear log</button>
+    </div>
+    <div class="tally" id="tally"></div>
+    <div id="logList" style="margin-top:12px;">
+      <p class="log-empty">No readings yet.</p>
+    </div>
+  </div>
+
+</div>
+
+<script>
+  const CLASS_NAMES = ['Blight', 'Common_Rust', 'Gray_Leaf_Spot', 'Healthy'];
+  const PEST_TEMP_MIN = 24, PEST_TEMP_MAX = 32, PEST_HUMIDITY_MIN = 60, GAS_THRESHOLD = 1027;
+  let currentFile = null;
+  let clientHistory = [];
+  let pollTimer = null;
+
+  const dropzone = document.getElementById('dropzone');
+  const fileInput = document.getElementById('fileInput');
+  const preview = document.getElementById('preview');
+  const dzPrompt = document.getElementById('dzPrompt');
+  const scanBtn = document.getElementById('scanBtn');
+  const scanLine = document.getElementById('scanLine');
+  const specimen = document.getElementById('specimen');
+  const errorMsg = document.getElementById('errorMsg');
+  const apiBaseInput = document.getElementById('apiBase');
+  const logList = document.getElementById('logList');
+  const tally = document.getElementById('tally');
+  const clearLogBtn = document.getElementById('clearLog');
+  const liveDot = document.getElementById('liveDot');
+  const liveText = document.getElementById('liveText');
+  const pestBanner = document.getElementById('pestBanner');
+  const pestReasons = document.getElementById('pestReasons');
+  const tempCard = document.getElementById('tempCard');
+  const humidityCard = document.getElementById('humidityCard');
+  const gasCard = document.getElementById('gasCard');
+  const tempValue = document.getElementById('tempValue');
+  const humidityValue = document.getElementById('humidityValue');
+  const gasValue = document.getElementById('gasValue');
+
+  function apiBase(){ return apiBaseInput.value.trim().replace(/\/$/, ''); }
+
+  dropzone.addEventListener('click', () => fileInput.click());
+  dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('drag'); });
+  dropzone.addEventListener('dragleave', () => dropzone.classList.remove('drag'));
+  dropzone.addEventListener('drop', e => {
+    e.preventDefault();
+    dropzone.classList.remove('drag');
+    if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+  });
+  fileInput.addEventListener('change', e => { if (e.target.files.length) handleFile(e.target.files[0]); });
+
+  function handleFile(file) {
+    if (!file.type.startsWith('image/')) { errorMsg.textContent = 'Please choose an image file.'; return; }
+    errorMsg.textContent = '';
+    currentFile = file;
+    const reader = new FileReader();
+    reader.onload = e => {
+      preview.src = e.target.result;
+      preview.style.display = 'block';
+      dzPrompt.style.display = 'none';
+    };
+    reader.readAsDataURL(file);
+    scanBtn.disabled = false;
+    scanBtn.textContent = 'Run test prediction';
+  }
+
+  scanBtn.addEventListener('click', async () => {
+    if (!currentFile) return;
+    const base = apiBase();
+    if (!base) { errorMsg.textContent = 'Enter the server base URL above.'; return; }
+    errorMsg.textContent = '';
+    scanBtn.disabled = true;
+    scanBtn.textContent = 'Scanning...';
+    scanLine.classList.add('active');
+
+    const formData = new FormData();
+    formData.append('image', currentFile);
+
+    try {
+      const res = await fetch(base + '/predict', { method: 'POST', body: formData });
+      if (!res.ok) throw new Error('Server responded ' + res.status);
+      const data = await res.json();
+      applyReading(data);
+    } catch (err) {
+      errorMsg.textContent = 'Could not reach the server: ' + err.message + '. Check the URL and that flask-cors is enabled.';
+    } finally {
+      scanLine.classList.remove('active');
+      scanBtn.disabled = false;
+      scanBtn.textContent = 'Run test prediction';
+    }
+  });
+
+  async function pollLatest() {
+    const base = apiBase();
+    if (!base) return;
+    try {
+      const res = await fetch(base + '/latest');
+      if (res.status === 404) { setLive(true); return; }
+      if (!res.ok) throw new Error('status ' + res.status);
+      const data = await res.json();
+      setLive(true);
+      applyReading(data);
+    } catch (err) {
+      setLive(false);
+    }
+  }
+
+  function setLive(ok) {
+    liveDot.classList.toggle('live', ok);
+    liveText.textContent = ok ? 'Connected' : 'Not connected';
+  }
+
+  let lastTimestamp = null;
+  function applyReading(data) {
+    if (data.timestamp && data.timestamp === lastTimestamp) return;
+    lastTimestamp = data.timestamp || null;
+
+    if (data.image) { preview.src = data.image; preview.style.display = 'block'; dzPrompt.style.display = 'none'; }
+    renderSpecimen(data);
+    renderSensors(data);
+    addToHistory(data);
+  }
+
+  function formatName(name){ return (name || '').replace(/_/g, ' '); }
+
+  function renderSpecimen(data) {
+    const isAlert = data.status === 'ALERT';
+    specimen.className = 'specimen' + (isAlert ? ' status-alert' : '');
+    specimen.innerHTML =
+      '<span class="eyebrow">Prediction</span>' +
+      '<p class="disease-name">' + formatName(data.disease) + '</p>' +
+      '<p class="confidence">Confidence <b>' + data.confidence + '</b></p>' +
+      '<span class="ribbon">' + (isAlert ? 'Alert — treat crop' : 'Healthy leaf') + '</span>';
+  }
+
+  function renderSensors(data) {
+    const t = data.temperature, h = data.humidity, g = data.gas;
+    tempValue.textContent = (t === null || t === undefined) ? '\u2014' : t.toFixed(1) + '\u00b0C';
+    humidityValue.textContent = (h === null || h === undefined) ? '\u2014' : h.toFixed(1) + '%';
+    gasValue.textContent = (g === null || g === undefined) ? '\u2014' : Math.round(g);
+
+    const tempFlag = t !== null && t !== undefined && t >= PEST_TEMP_MIN && t <= PEST_TEMP_MAX;
+    const humFlag = h !== null && h !== undefined && h >= PEST_HUMIDITY_MIN;
+    const gasFlag = g !== null && g !== undefined && g >= GAS_THRESHOLD;
+    tempCard.classList.toggle('flag', tempFlag);
+    humidityCard.classList.toggle('flag', humFlag);
+    gasCard.classList.toggle('flag', gasFlag);
+
+    const risk = data.pest_risk || (tempFlag && (humFlag || gasFlag) ? 'HIGH' : 'LOW');
+    const reasons = data.pest_reasons || [];
+    if (risk === 'HIGH') {
+      pestBanner.classList.add('show');
+      pestReasons.innerHTML = reasons.length
+        ? reasons.map(r => '<li>' + r + '</li>').join('')
+        : '<li>Temperature and humidity/gas readings align with pest-favorable conditions.</li>';
+    } else {
+      pestBanner.classList.remove('show');
+    }
+  }
+
+  function addToHistory(data) {
+    clientHistory.unshift(data);
+    renderHistory(clientHistory);
+  }
+
+  async function refreshHistoryFromServer() {
+    const base = apiBase();
+    if (!base) return;
+    try {
+      const res = await fetch(base + '/history');
+      if (!res.ok) return;
+      const data = await res.json();
+      if (Array.isArray(data) && data.length) { clientHistory = data; renderHistory(clientHistory); }
+    } catch (err) { }
+  }
+
+  function renderHistory(items) {
+    if (!items.length) {
+      logList.innerHTML = '<p class="log-empty">No readings yet.</p>';
+      tally.innerHTML = '';
+      return;
+    }
+    logList.innerHTML = items.map(h => {
+      const sensorBits = [];
+      if (h.temperature !== null && h.temperature !== undefined) sensorBits.push(h.temperature.toFixed(1) + '\u00b0C');
+      if (h.humidity !== null && h.humidity !== undefined) sensorBits.push(h.humidity.toFixed(1) + '%RH');
+      if (h.gas !== null && h.gas !== undefined) sensorBits.push('gas ' + Math.round(h.gas));
+      const time = h.timestamp ? new Date(h.timestamp).toLocaleTimeString() : '';
+      return '<div class="log-row">' +
+        '<img class="log-thumb" src="' + (h.image || '') + '">' +
+        '<div><div class="log-disease">' + formatName(h.disease) + '</div>' +
+        '<div class="log-time">' + time + '</div></div>' +
+        '<div class="log-sensors">' + (sensorBits.join(' &middot; ') || '\u2014') + '</div>' +
+        '<span class="log-chip ' + (h.status === 'ALERT' ? 'alert' : '') + '">' + (h.status || '') + '</span>' +
+        '<span class="log-chip ' + (h.pest_risk === 'HIGH' ? 'pest' : '') + '">' + (h.pest_risk === 'HIGH' ? 'pest risk' : 'pest ok') + '</span>' +
+        '</div>';
+    }).join('');
+
+    const counts = {}; CLASS_NAMES.forEach(c => counts[c] = 0);
+    items.forEach(h => { if (counts[h.disease] !== undefined) counts[h.disease]++; });
+    tally.innerHTML = CLASS_NAMES.map(c => '<span class="tally-chip">' + formatName(c) + ': <b>' + counts[c] + '</b></span>').join('');
+  }
+
+  clearLogBtn.addEventListener('click', () => { clientHistory = []; renderHistory(clientHistory); });
+
+  function startPolling() {
+    if (pollTimer) clearInterval(pollTimer);
+    pollLatest();
+    refreshHistoryFromServer();
+    pollTimer = setInterval(() => { pollLatest(); refreshHistoryFromServer(); }, 4000);
+  }
+  apiBaseInput.addEventListener('change', startPolling);
+  startPolling();
+</script>
+</body>
+</html>
