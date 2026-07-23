@@ -569,7 +569,7 @@ def api_stats():
         "avg_confidence":   round(avg_c, 1) if avg_c else 0,
         "last_scan_time":   last[0] if last else None,
     })
-
+  
 @app.route("/uploads/<path:filename>")
 def serve_upload(filename):
     return send_from_directory(UPLOAD_DIR, filename)
