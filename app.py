@@ -21,8 +21,8 @@ import onnxruntime as ort
 # ── Config ────────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-GATE_MODEL_URL    = "https://huggingface.co/path/to/gate_model.onnx"
-DISEASE_MODEL_URL = "https://huggingface.co/path/to/best.onnx"
+GATE_MODEL_URL    = "https://huggingface.co/Samson123Ade/maize-infection-detection/resolve/main/gate_model.onnx"
+DISEASE_MODEL_URL = "https://huggingface.co/Samson123Ade/maize-infection-detection/resolve/main/best.onnx"
 
 GATE_LOCAL_PATH    = os.path.join(BASE_DIR, "models", "gate_model.onnx")
 DISEASE_LOCAL_PATH = os.path.join(BASE_DIR, "models", "best.onnx")
