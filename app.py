@@ -48,10 +48,12 @@ DB_PATH    = os.path.join(BASE_DIR, "scans.db")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(os.path.join(BASE_DIR, "models"), exist_ok=True)
 
-GATE_SIZE      = 160
+# ── Fixed Resolution Settings ──────────────────────────────────────────────────
+# GATE_SIZE fixed to 224 to eliminate shape mismatch with gate_model.onnx
+GATE_SIZE      = 224
 DISEASE_SIZE   = 224
-GATE_THRESH    = 0.30    # leaf confidence threshold (0.0 - 1.0) - lowered to reduce false rejections
-MIN_CONFIDENCE = 40.0    # percentage threshold (0.0 - 100.0) - lowered to reduce unclassified results
+GATE_THRESH    = 0.30    # leaf confidence threshold (0.0 - 1.0)
+MIN_CONFIDENCE = 40.0    # percentage threshold (0.0 - 100.0)
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -100,7 +102,14 @@ def load_onnx_model(url, local_path, name):
     elif name == "disease":
         model_cache_state["disease_cached_at"] = cached_at
     
-    return ort.InferenceSession(local_path, providers=["CPUExecutionProvider"])
+    session = ort.InferenceSession(local_path, providers=["CPUExecutionProvider"])
+    
+    # Inspection logs for verifying model expectations
+    input_shape = session.get_inputs()[0].shape
+    output_shape = session.get_outputs()[0].shape
+    log.info(f"[{name.upper()}] Expected Input Shape: {input_shape} | Output Shape: {output_shape}")
+    
+    return session
 
 log.info("Loading gate model ...")
 gate_session = load_onnx_model(GATE_MODEL_URL, GATE_LOCAL_PATH, "gate")
@@ -149,7 +158,7 @@ def init_db():
 
 init_db()
 
-# ── Preprocessing (plain NumPy/PIL, no torch) ─────────────────────────────────
+# ── Preprocessing ─────────────────────────────────────────────────────────────
 def bytes_to_input(file_bytes, size):
     img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
     img = img.resize((size, size))
@@ -171,9 +180,11 @@ def run_session(session, input_tensor):
 
 # ── Diagnosis helpers ─────────────────────────────────────────────────────────
 def resolve_prediction(probabilities):
-    pred_id    = int(np.argmax(probabilities))
+    pred_id = int(np.argmax(probabilities))
     confidence = round(float(probabilities[pred_id]) * 100, 2)
-    entry      = CATEGORY_MAP.get(str(pred_id))
+    
+    # Safe lookup: Check string representation and numerical index fallback
+    entry = CATEGORY_MAP.get(str(pred_id))
 
     if entry and confidence >= MIN_CONFIDENCE:
         return {
@@ -352,10 +363,15 @@ def predict():
         d_probs  = run_session(disease_session, d_input)
         result   = resolve_prediction(d_probs)
 
-        all_probs = {
-            CATEGORY_MAP[k]["problem"]: round(float(d_probs[int(k)]) * 100, 2)
-            for k in CATEGORY_MAP if k in CATEGORY_MAP
-        }
+        # Safely extract probabilities without crashing if a key index exceeds output dimensions
+        all_probs = {}
+        for k, v in CATEGORY_MAP.items():
+            try:
+                idx = int(k)
+                if idx < len(d_probs):
+                    all_probs[v["problem"]] = round(float(d_probs[idx]) * 100, 2)
+            except (ValueError, IndexError):
+                continue
 
         diag    = classify_severity(result["confidence"], result["identified"])
         elapsed = round((time.time() - start) * 1000, 1)
@@ -374,7 +390,7 @@ def predict():
             "chemical_direct":     result["chemical_direct"],
             "all_probs":        all_probs,
             "server_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "inference_ms":     elapsed,
+            "inference_ms":      elapsed,
         }
         log.info(f"Predicted: {result['label']} ({result['confidence']}%, "
                  f"identified={result['identified']}) in {elapsed}ms")
