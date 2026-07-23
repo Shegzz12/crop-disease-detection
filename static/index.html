@@ -397,7 +397,7 @@
     const base = apiBase();
     if (!base) return;
     try {
-      const res = await fetch(base + '/history');
+      const res = await fetch(base + '/api/history');
       if (!res.ok) return;
       const data = await res.json();
       if (Array.isArray(data) && data.length) { clientHistory = data; renderHistory(clientHistory); }
