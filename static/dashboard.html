@@ -120,7 +120,13 @@
         <p class="subtitle">Maize disease &amp; pest-risk watch</p>
       </div>
     </div>
-    <div class="stamp">blight &middot; rust &middot; gray leaf spot &middot; healthy</div>
+    <div style="display:flex;align-items:center;gap:1rem;flex-wrap:wrap;">
+      <div class="stamp" id="modelCacheIndicator" style="display:none;gap:6px;background:var(--leaf-tint);border-color:var(--leaf);color:var(--leaf);">
+        <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--leaf);"></span>
+        Model cached
+      </div>
+      <div class="stamp">blight &middot; rust &middot; gray leaf spot &middot; healthy</div>
+    </div>
   </header>
 
   <div class="panel">
@@ -144,7 +150,7 @@
     </div>
   </div>
 
-  <div class="sensor-grid">
+  <div class="sensor-grid" style="grid-template-columns:repeat(4,1fr);">
     <div class="sensor-card" id="tempCard">
       <div class="s-label">Temperature</div>
       <div class="s-value" id="tempValue">&mdash;</div>
@@ -159,6 +165,11 @@
       <div class="s-label">Gas reading</div>
       <div class="s-value" id="gasValue">&mdash;</div>
       <div class="s-note">Flag above 1027 (calibrate to your sensor)</div>
+    </div>
+    <div class="sensor-card" id="gasVoltageCard">
+      <div class="s-label">Gas Voltage</div>
+      <div class="s-value" id="gasVoltageValue">&mdash;</div>
+      <div class="s-note">Raw sensor voltage output</div>
     </div>
   </div>
 
@@ -203,11 +214,11 @@
 </div>
 
 <script>
-  const CLASS_NAMES = ['Blight', 'Common_Rust', 'Gray_Leaf_Spot', 'Healthy'];
   const PEST_TEMP_MIN = 24, PEST_TEMP_MAX = 32, PEST_HUMIDITY_MIN = 60, GAS_THRESHOLD = 1027;
   let currentFile = null;
   let clientHistory = [];
   let pollTimer = null;
+  let modelCacheIndicatorTimer = null;
 
   const dropzone = document.getElementById('dropzone');
   const fileInput = document.getElementById('fileInput');
@@ -225,14 +236,37 @@
   const liveText = document.getElementById('liveText');
   const pestBanner = document.getElementById('pestBanner');
   const pestReasons = document.getElementById('pestReasons');
+  const modelCacheIndicator = document.getElementById('modelCacheIndicator');
   const tempCard = document.getElementById('tempCard');
   const humidityCard = document.getElementById('humidityCard');
   const gasCard = document.getElementById('gasCard');
+  const gasVoltageCard = document.getElementById('gasVoltageCard');
   const tempValue = document.getElementById('tempValue');
   const humidityValue = document.getElementById('humidityValue');
   const gasValue = document.getElementById('gasValue');
+  const gasVoltageValue = document.getElementById('gasVoltageValue');
 
   function apiBase(){ return apiBaseInput.value.trim().replace(/\/$/, ''); }
+
+  async function checkModelCacheStatus() {
+    const base = apiBase();
+    if (!base) return;
+    try {
+      const res = await fetch(base + '/api/model-status');
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data.cached) {
+        modelCacheIndicator.style.display = 'flex';
+        // Auto-hide after 4 seconds
+        if (modelCacheIndicatorTimer) clearTimeout(modelCacheIndicatorTimer);
+        modelCacheIndicatorTimer = setTimeout(() => {
+          modelCacheIndicator.style.display = 'none';
+        }, 4000);
+      }
+    } catch (err) {
+      // Silent fail - not a critical feature
+    }
+  }
 
   dropzone.addEventListener('click', () => fileInput.click());
   dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('drag'); });
@@ -319,7 +353,7 @@
   function formatName(name){ return (name || '').replace(/_/g, ' '); }
 
   function renderSpecimen(data) {
-    const isAlert = data.status === 'ALERT';
+    const isAlert = data.status === 'sick';
     specimen.className = 'specimen' + (isAlert ? ' status-alert' : '');
     specimen.innerHTML =
       '<span class="eyebrow">Prediction</span>' +
@@ -329,10 +363,11 @@
   }
 
   function renderSensors(data) {
-    const t = data.temperature, h = data.humidity, g = data.gas;
+    const t = data.temperature, h = data.humidity, g = data.gas, gv = data.gas_voltage;
     tempValue.textContent = (t === null || t === undefined) ? '\u2014' : t.toFixed(1) + '\u00b0C';
     humidityValue.textContent = (h === null || h === undefined) ? '\u2014' : h.toFixed(1) + '%';
     gasValue.textContent = (g === null || g === undefined) ? '\u2014' : Math.round(g);
+    gasVoltageValue.textContent = (gv === null || gv === undefined) ? '\u2014' : parseFloat(gv).toFixed(2) + 'V';
 
     const tempFlag = t !== null && t !== undefined && t >= PEST_TEMP_MIN && t <= PEST_TEMP_MAX;
     const humFlag = h !== null && h !== undefined && h >= PEST_HUMIDITY_MIN;
@@ -382,27 +417,33 @@
       if (h.gas !== null && h.gas !== undefined) sensorBits.push('gas ' + Math.round(h.gas));
       const time = h.timestamp ? new Date(h.timestamp).toLocaleTimeString() : '';
       return '<div class="log-row">' +
-        '<img class="log-thumb" src="' + (h.image || '') + '">' +
+        '<img class="log-thumb" src="' + (h.image_url || '') + '">' +
         '<div><div class="log-disease">' + formatName(h.disease) + '</div>' +
         '<div class="log-time">' + time + '</div></div>' +
         '<div class="log-sensors">' + (sensorBits.join(' &middot; ') || '\u2014') + '</div>' +
-        '<span class="log-chip ' + (h.status === 'ALERT' ? 'alert' : '') + '">' + (h.status || '') + '</span>' +
+        '<span class="log-chip ' + (h.status === 'sick' ? 'alert' : '') + '">' + (h.status || '') + '</span>' +
         '<span class="log-chip ' + (h.pest_risk === 'HIGH' ? 'pest' : '') + '">' + (h.pest_risk === 'HIGH' ? 'pest risk' : 'pest ok') + '</span>' +
         '</div>';
     }).join('');
 
-    const counts = {}; CLASS_NAMES.forEach(c => counts[c] = 0);
-    items.forEach(h => { if (counts[h.disease] !== undefined) counts[h.disease]++; });
-    tally.innerHTML = CLASS_NAMES.map(c => '<span class="tally-chip">' + formatName(c) + ': <b>' + counts[c] + '</b></span>').join('');
+    // Build tally from actual items (dynamic rather than hardcoded)
+    const counts = {};
+    items.forEach(h => {
+      const disease = h.disease || 'Unknown';
+      counts[disease] = (counts[disease] || 0) + 1;
+    });
+    const sortedDiseases = Object.keys(counts).sort();
+    tally.innerHTML = sortedDiseases.map(c => '<span class="tally-chip">' + formatName(c) + ': <b>' + counts[c] + '</b></span>').join('');
   }
 
   clearLogBtn.addEventListener('click', () => { clientHistory = []; renderHistory(clientHistory); });
 
   function startPolling() {
     if (pollTimer) clearInterval(pollTimer);
+    checkModelCacheStatus();
     pollLatest();
     refreshHistoryFromServer();
-    pollTimer = setInterval(() => { pollLatest(); refreshHistoryFromServer(); }, 4000);
+    pollTimer = setInterval(() => { checkModelCacheStatus(); pollLatest(); refreshHistoryFromServer(); }, 4000);
   }
   apiBaseInput.addEventListener('change', startPolling);
   startPolling();
