@@ -4,9 +4,6 @@ FarmBot Backend — ONNX Runtime edition (models cached from Hugging Face)
 Runs two models in sequence:
   1. Gate model     (gate_model.onnx) → is there a maize leaf in the image?
   2. Disease model (best.onnx)        → 102-way IP102 pest classifier.
-     Only the "corn" block of that classifier (class ids 14-24) is treated
-     as a maize-relevant match; anything else falls back to a generic
-     result rather than showing an unrelated crop's pest name.
 """
 import os, io, time, logging, sqlite3, uuid, json
 import urllib.request
@@ -28,7 +25,7 @@ GATE_LOCAL_PATH    = os.path.join(BASE_DIR, "models", "gate_model.onnx")
 DISEASE_LOCAL_PATH = os.path.join(BASE_DIR, "models", "best.onnx")
 
 CATEGORY_FILE = os.path.join(BASE_DIR, "categories.json")
-CATEGORY_MAP  = {}   # populated by load_categories(); keys are original model class-ids ("14".."24")
+CATEGORY_MAP  = {}
 
 FALLBACK_LABEL = "Unclassified Detection"
 FALLBACK_ADVICE = {
@@ -48,12 +45,20 @@ DB_PATH    = os.path.join(BASE_DIR, "scans.db")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(os.path.join(BASE_DIR, "models"), exist_ok=True)
 
-# ── Fixed Resolution Settings ──────────────────────────────────────────────────
-# GATE_SIZE fixed to 224 to eliminate shape mismatch with gate_model.onnx
-GATE_SIZE      = 224
-DISEASE_SIZE   = 224
-GATE_THRESH    = 0.30    # leaf confidence threshold (0.0 - 1.0)
-MIN_CONFIDENCE = 40.0    # percentage threshold (0.0 - 100.0)
+# ── Model Resolution & Threshold Settings ──────────────────────────────────────
+GATE_SIZE       = 224
+DISEASE_SIZE    = 224
+GATE_THRESH     = 0.30     # confidence threshold for leaf detection
+
+# ⚠️ CLASS INDEX ADJUSTMENT:
+# Set GATE_LEAF_INDEX = 0 if index 0 represents "leaf".
+# Set GATE_LEAF_INDEX = 1 if index 1 represents "leaf".
+GATE_LEAF_INDEX = 0
+
+# Set COLOR_MODE to "BGR" if the gate model was trained using OpenCV/Albumentations defaults
+COLOR_MODE      = "BGR"    # "RGB" or "BGR"
+
+MIN_CONFIDENCE  = 40.0
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -65,38 +70,31 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("farmbot")
 
-# ── Model cache tracking ──────────────────────────────────────────────────────
 model_cache_state = {
     "gate_cached_at": None,
     "disease_cached_at": None,
 }
 
-# ── Categories (maize-relevant subset only) ───────────────────────────────────
+# ── Categories ────────────────────────────────────────────────────────────────
 def load_categories():
     global CATEGORY_MAP
     if os.path.exists(CATEGORY_FILE):
         try:
             with open(CATEGORY_FILE, "r", encoding="utf-8") as f:
                 CATEGORY_MAP = json.load(f)
-            log.info(f"Loaded {len(CATEGORY_MAP)} maize-relevant categories from categories.json")
+            log.info(f"Loaded {len(CATEGORY_MAP)} categories from categories.json")
         except Exception as e:
             log.warning(f"Failed to load categories.json: {e}")
-    else:
-        log.warning(f"categories.json not found at {CATEGORY_FILE}")
 
 load_categories()
 
-# ── Download + load ONNX models (cached to disk after first run) ─────────────
+# ── Download + Load ONNX Models ───────────────────────────────────────────────
 def load_onnx_model(url, local_path, name):
     if not os.path.exists(local_path):
-        log.info(f"Downloading {name} model from Hugging Face: {url} ...")
+        log.info(f"Downloading {name} model from Hugging Face...")
         urllib.request.urlretrieve(url, local_path)
-        log.info(f"{name} model download complete.")
-    else:
-        log.info(f"{name} model already cached at {local_path}")
     
     cached_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
     if name == "gate":
         model_cache_state["gate_cached_at"] = cached_at
     elif name == "disease":
@@ -104,10 +102,9 @@ def load_onnx_model(url, local_path, name):
     
     session = ort.InferenceSession(local_path, providers=["CPUExecutionProvider"])
     
-    # Inspection logs for verifying model expectations
     input_shape = session.get_inputs()[0].shape
     output_shape = session.get_outputs()[0].shape
-    log.info(f"[{name.upper()}] Expected Input Shape: {input_shape} | Output Shape: {output_shape}")
+    log.info(f"[{name.upper()}] Expected Input: {input_shape} | Output: {output_shape}")
     
     return session
 
@@ -115,9 +112,8 @@ log.info("Loading gate model ...")
 gate_session = load_onnx_model(GATE_MODEL_URL, GATE_LOCAL_PATH, "gate")
 log.info("Loading disease model ...")
 disease_session = load_onnx_model(DISEASE_MODEL_URL, DISEASE_LOCAL_PATH, "disease")
-log.info("Both models ready.")
 
-# ── Flask + DB ────────────────────────────────────────────────────────────────
+# ── Flask + Database Init ─────────────────────────────────────────────────────
 app = Flask(__name__, static_folder="static", static_url_path="")
 CORS(app)
 
@@ -159,10 +155,15 @@ def init_db():
 init_db()
 
 # ── Preprocessing ─────────────────────────────────────────────────────────────
-def bytes_to_input(file_bytes, size):
+def bytes_to_input(file_bytes, size, color_mode="RGB"):
     img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
     img = img.resize((size, size))
-    arr = np.array(img).astype(np.float32) / 255.0
+    arr = np.array(img).astype(np.float32)
+    
+    if color_mode == "BGR":
+        arr = arr[:, :, ::-1]  # RGB to BGR
+        
+    arr = arr / 255.0
     arr = (arr - IMAGENET_MEAN) / IMAGENET_STD
     arr = np.transpose(arr, (2, 0, 1))          # HWC -> CHW
     arr = np.expand_dims(arr, axis=0).astype(np.float32)
@@ -178,12 +179,9 @@ def run_session(session, input_tensor):
     raw = session.run([output_name], {input_name: input_tensor})[0][0]
     return softmax(raw)
 
-# ── Diagnosis helpers ─────────────────────────────────────────────────────────
 def resolve_prediction(probabilities):
     pred_id = int(np.argmax(probabilities))
     confidence = round(float(probabilities[pred_id]) * 100, 2)
-    
-    # Safe lookup: Check string representation and numerical index fallback
     entry = CATEGORY_MAP.get(str(pred_id))
 
     if entry and confidence >= MIN_CONFIDENCE:
@@ -213,7 +211,6 @@ def classify_severity(confidence, identified):
 
 def calculate_pest_risk(confidence, identified, temperature, humidity, gas_raw):
     pest_reasons = []
-    
     if temperature is not None:
         try:
             t = float(temperature)
@@ -229,15 +226,7 @@ def calculate_pest_risk(confidence, identified, temperature, humidity, gas_raw):
                 pest_reasons.append(f"Humidity {h:.1f}% supports disease development")
         except (ValueError, TypeError):
             pass
-    
-    if gas_raw is not None:
-        try:
-            g = float(gas_raw)
-            if g >= 1027:
-                pest_reasons.append(f"Gas sensor reading {g:.0f} indicates potential stress")
-        except (ValueError, TypeError):
-            pass
-    
+            
     risk = "HIGH" if identified and len(pest_reasons) >= 2 else "LOW"
     return risk, pest_reasons
 
@@ -290,19 +279,6 @@ def health():
         "categories_count": len(CATEGORY_MAP),
     })
 
-@app.route("/api/categories")
-def api_categories():
-    return jsonify({"success": True, "count": len(CATEGORY_MAP), "categories": CATEGORY_MAP})
-
-@app.route("/api/model-status")
-def api_model_status():
-    cached = model_cache_state["gate_cached_at"] is not None and model_cache_state["disease_cached_at"] is not None
-    return jsonify({
-        "cached": cached,
-        "gate_model_cached_at": model_cache_state["gate_cached_at"],
-        "disease_model_cached_at": model_cache_state["disease_cached_at"],
-    })
-
 @app.route("/predict", methods=["POST"])
 def predict():
     start = time.time()
@@ -315,25 +291,19 @@ def predict():
         return jsonify({"error": "Empty image."}), 400
     
     temperature = request.form.get("temperature")
-    humidity = request.form.get("humidity")
-    gas_raw = request.form.get("gas_raw")
+    humidity    = request.form.get("humidity")
+    gas_raw     = request.form.get("gas_raw")
     gas_voltage = request.form.get("gas_voltage")
     
     try:
-        temperature = float(temperature) if temperature else None
-    except (ValueError, TypeError):
-        temperature = None
-    
-    try:
-        humidity = float(humidity) if humidity else None
-    except (ValueError, TypeError):
-        humidity = None
-
-    try:
-        # ── Stage 1: Gate ─────────────────────────────────────────────────────
-        g_input   = bytes_to_input(file_bytes, GATE_SIZE)
+        # ── Stage 1: Gate Model Check ──────────────────────────────────────────
+        g_input   = bytes_to_input(file_bytes, GATE_SIZE, color_mode=COLOR_MODE)
         g_probs   = run_session(gate_session, g_input)
-        leaf_conf = float(g_probs[1])
+        
+        # Log both class outputs to clarify index mapping
+        log.info(f"Gate Output Raw Probs -> Class 0: {g_probs[0]:.4f} | Class 1: {g_probs[1]:.4f}")
+        
+        leaf_conf = float(g_probs[GATE_LEAF_INDEX])
         is_leaf   = leaf_conf >= GATE_THRESH
 
         if not is_leaf:
@@ -358,12 +328,11 @@ def predict():
             _save_scan(file_bytes, raw_response, device_time, temperature, humidity, gas_raw, gas_voltage)
             return jsonify(response), 200
 
-        # ── Stage 2: Disease ──────────────────────────────────────────────────
-        d_input  = bytes_to_input(file_bytes, DISEASE_SIZE)
+        # ── Stage 2: Disease Classification ───────────────────────────────────
+        d_input  = bytes_to_input(file_bytes, DISEASE_SIZE, color_mode="RGB")
         d_probs  = run_session(disease_session, d_input)
         result   = resolve_prediction(d_probs)
 
-        # Safely extract probabilities without crashing if a key index exceeds output dimensions
         all_probs = {}
         for k, v in CATEGORY_MAP.items():
             try:
@@ -392,8 +361,7 @@ def predict():
             "server_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "inference_ms":      elapsed,
         }
-        log.info(f"Predicted: {result['label']} ({result['confidence']}%, "
-                 f"identified={result['identified']}) in {elapsed}ms")
+        log.info(f"Predicted: {result['label']} ({result['confidence']}%, identified={result['identified']}) in {elapsed}ms")
         
         response = transform_response_to_frontend(raw_response, temperature, humidity, gas_raw, gas_voltage)
         _save_scan(file_bytes, raw_response, device_time, temperature, humidity, gas_raw, gas_voltage)
@@ -405,8 +373,7 @@ def predict():
 
 def _save_scan(file_bytes, resp, device_time, temperature=None, humidity=None, gas_raw=None, gas_voltage=None):
     try:
-        filename = (f"scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                    f"_{uuid.uuid4().hex[:8]}.jpg")
+        filename = f"scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.jpg"
         with open(os.path.join(UPLOAD_DIR, filename), "wb") as f:
             f.write(file_bytes)
         conn = get_db()
@@ -442,7 +409,7 @@ def _save_scan(file_bytes, resp, device_time, temperature=None, humidity=None, g
         conn.commit()
         conn.close()
     except Exception:
-        log.exception("Failed to save scan (prediction still returned)")
+        log.exception("Failed to save scan")
 
 @app.route("/latest")
 def api_latest():
@@ -503,15 +470,10 @@ def api_history():
 
     conn = get_db()
     if status in ("sick", "unclassified", "no_leaf"):
-        rows  = conn.execute(
-            "SELECT * FROM scans WHERE status=? ORDER BY id DESC LIMIT ? OFFSET ?",
-            (status, limit, offset)).fetchall()
-        total = conn.execute(
-            "SELECT COUNT(*) FROM scans WHERE status=?", (status,)).fetchone()[0]
+        rows  = conn.execute("SELECT * FROM scans WHERE status=? ORDER BY id DESC LIMIT ? OFFSET ?", (status, limit, offset)).fetchall()
+        total = conn.execute("SELECT COUNT(*) FROM scans WHERE status=?", (status,)).fetchone()[0]
     else:
-        rows  = conn.execute(
-            "SELECT * FROM scans ORDER BY id DESC LIMIT ? OFFSET ?",
-            (limit, offset)).fetchall()
+        rows  = conn.execute("SELECT * FROM scans ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
         total = conn.execute("SELECT COUNT(*) FROM scans").fetchone()[0]
     conn.close()
 
@@ -556,7 +518,6 @@ def api_history():
         )
         transformed["pest_risk"] = risk
         transformed["pest_reasons"] = reasons
-        
         items.append(transformed)
 
     return jsonify({"items": items, "total": total, "limit": limit, "offset": offset})
@@ -568,12 +529,8 @@ def api_stats():
     sick         = conn.execute("SELECT COUNT(*) FROM scans WHERE status='sick'").fetchone()[0]
     unclassified = conn.execute("SELECT COUNT(*) FROM scans WHERE status='unclassified'").fetchone()[0]
     no_leaf      = conn.execute("SELECT COUNT(*) FROM scans WHERE status='no_leaf'").fetchone()[0]
-    last    = conn.execute(
-        "SELECT COALESCE(device_time, server_time) FROM scans ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    avg_c   = conn.execute(
-        "SELECT AVG(confidence) FROM scans WHERE is_leaf=1"
-    ).fetchone()[0]
+    last         = conn.execute("SELECT COALESCE(device_time, server_time) FROM scans ORDER BY id DESC LIMIT 1").fetchone()
+    avg_c        = conn.execute("SELECT AVG(confidence) FROM scans WHERE is_leaf=1").fetchone()[0]
     conn.close()
     return jsonify({
         "total":            total,
