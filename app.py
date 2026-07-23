@@ -48,10 +48,10 @@ DB_PATH    = os.path.join(BASE_DIR, "scans.db")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(os.path.join(BASE_DIR, "models"), exist_ok=True)
 
-GATE_SIZE      = 224
+GATE_SIZE      = 160
 DISEASE_SIZE   = 224
-GATE_THRESH    = 0.60    # leaf confidence threshold (0.0 - 1.0)
-MIN_CONFIDENCE = 55.0    # percentage threshold (0.0 - 100.0)
+GATE_THRESH    = 0.30    # leaf confidence threshold (0.0 - 1.0) - lowered to reduce false rejections
+MIN_CONFIDENCE = 40.0    # percentage threshold (0.0 - 100.0) - lowered to reduce unclassified results
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -569,7 +569,7 @@ def api_stats():
         "avg_confidence":   round(avg_c, 1) if avg_c else 0,
         "last_scan_time":   last[0] if last else None,
     })
-  
+
 @app.route("/uploads/<path:filename>")
 def serve_upload(filename):
     return send_from_directory(UPLOAD_DIR, filename)
