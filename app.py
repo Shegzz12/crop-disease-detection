@@ -1,200 +1,628 @@
+# ── backend/app.py ────────────────────────────────────────────────────────────
 """
-Maize Disease API — Render deployment
-======================================
-Image inference is forwarded to the Hugging Face Space:
-    https://dracer-crop-desease-detection.hf.space/predict
-
-No model files needed on Render. The response is mapped back to the
-existing format so the ESP32 firmware and dashboard need zero changes.
-
-Everything else is identical to the original app:
-  - /predict     → receives image + sensor data from ESP32
-  - /latest      → last reading
-  - /history     → recent readings
-  - /dashboard   → serves static/dashboard.html
-  - /            → redirects to /dashboard
+FarmBot Backend — ONNX Runtime edition (models cached from Hugging Face)
+Runs two models in sequence:
+  1. Gate model    (gate_model.onnx) → is there a maize leaf in the image?
+  2. Disease model (best.onnx)       → 102-way IP102 pest classifier.
+     Only the "corn" block of that classifier (class ids 14-24) is treated
+     as a maize-relevant match; anything else falls back to a generic
+     result rather than showing an unrelated crop's pest name.
 """
+import os, io, time, logging, sqlite3, uuid, json
+import urllib.request
+from datetime import datetime
 
-import io, base64, os, logging
-from datetime import datetime, timezone
-from collections import deque
-
-import requests                         # HTTP forwarding to HF Space
-from flask import Flask, request, jsonify, send_from_directory, redirect
+import numpy as np
+from PIL import Image
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
+import onnxruntime as ort
 
 # ── Config ────────────────────────────────────────────────────────────────────
-# Set HF_SPACE_URL as an environment variable on Render if you ever want to
-# switch endpoints without redeploying.
-HF_SPACE_URL = os.environ.get(
-    "HF_SPACE_URL",
-    "https://dracer-crop-desease-detection.hf.space/predict"
-)
-HF_TIMEOUT = 30   # seconds — HF free tier can cold-start in ~15 s
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Pest thresholds (unchanged)
-PEST_TEMP_MIN     = 24.0
-PEST_TEMP_MAX     = 32.0
-PEST_HUMIDITY_MIN = 60.0
-GAS_THRESHOLD     = 1027
+GATE_MODEL_URL    = "https://huggingface.co/path/to/gate_model.onnx"
+DISEASE_MODEL_URL = "https://huggingface.co/path/to/best.onnx"
 
-HISTORY_MAXLEN = 50
+GATE_LOCAL_PATH    = os.path.join(BASE_DIR, "models", "gate_model.onnx")
+DISEASE_LOCAL_PATH = os.path.join(BASE_DIR, "models", "best.onnx")
+
+CATEGORY_FILE = os.path.join(BASE_DIR, "categories.json")
+CATEGORY_MAP  = {}   # populated by load_categories(); keys are the ORIGINAL
+                      # model class-id strings ("14".."24"), do not renumber
+
+FALLBACK_LABEL = "Unclassified Detection"
+FALLBACK_ADVICE = {
+    "cultural_biological": (
+        "The affected area doesn't match a specific pest in our maize catalog. "
+        "Isolate/inspect the plant, remove visibly damaged foliage, and monitor "
+        "for spread before treating."
+    ),
+    "chemical_direct": (
+        "Hold off on a specific chemical until the exact cause is confirmed — "
+        "consult a local agronomist or extension officer with a close-up photo."
+    ),
+}
+
+UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
+DB_PATH    = os.path.join(BASE_DIR, "scans.db")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(os.path.join(BASE_DIR, "models"), exist_ok=True)
+
+GATE_SIZE      = 160
+DISEASE_SIZE   = 224
+GATE_THRESH    = 0.6                                          # leaf confidence must exceed this
+MIN_CONFIDENCE = 0.55                                         # below this, even a whitelisted
+                                                                # class id falls back to FALLBACK_LABEL
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406])
+IMAGENET_STD  = np.array([0.229, 0.224, 0.225])
+
+PORT = int(os.environ.get("PORT", 5500))
+HOST = "0.0.0.0"
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("maize-proxy")
+log = logging.getLogger("farmbot")
 
-# ── Flask ─────────────────────────────────────────────────────────────────────
-app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+# ── Model cache tracking ──────────────────────────────────────────────────────
+model_cache_state = {
+    "gate_cached_at": None,
+    "disease_cached_at": None,
+}
 
-history        = deque(maxlen=HISTORY_MAXLEN)
-latest_reading = None
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def parse_float(v):
-    try:    return float(v)
-    except: return None
-
-def assess_pest_risk(temperature, humidity, gas):
-    reasons = []
-    temp_ok = temperature is not None and PEST_TEMP_MIN <= temperature <= PEST_TEMP_MAX
-    hum_ok  = humidity    is not None and humidity >= PEST_HUMIDITY_MIN
-    gas_ok  = gas         is not None and gas      >= GAS_THRESHOLD
-    if temp_ok: reasons.append(f"Temperature {temperature:.1f}°C is in the pest-favorable range")
-    if hum_ok:  reasons.append(f"Humidity {humidity:.1f}% is above the {PEST_HUMIDITY_MIN:.0f}% threshold")
-    if gas_ok:  reasons.append(f"Gas reading {gas:.0f} is above the {GAS_THRESHOLD:.0f} threshold")
-    return ("HIGH" if (temp_ok and (hum_ok or gas_ok)) else "LOW"), reasons
-
-def map_hf_response(hf_data):
-    """
-    Maps whatever the HF Space returns into the existing response keys
-    the ESP32 and dashboard already expect.
-
-    HF Space may return (cassava-style):
-        label, confidence, status, is_leaf, advice, all_probs ...
-    Or a simpler format:
-        disease, confidence, status ...
-
-    We handle both gracefully.
-    """
-    # Disease label — try both key names
-    disease = (hf_data.get("label")
-               or hf_data.get("disease")
-               or "Unknown")
-
-    # Confidence — strip "%" if it's already a string, else use float
-    raw_conf = hf_data.get("confidence", 0)
-    if isinstance(raw_conf, str):
-        conf_str = raw_conf if raw_conf.endswith("%") else raw_conf + "%"
-        conf_float = float(raw_conf.strip("%"))
+# ── Categories (maize-relevant subset only) ───────────────────────────────────
+def load_categories():
+    global CATEGORY_MAP
+    if os.path.exists(CATEGORY_FILE):
+        try:
+            with open(CATEGORY_FILE, "r", encoding="utf-8") as f:
+                CATEGORY_MAP = json.load(f)
+            log.info(f"Loaded {len(CATEGORY_MAP)} maize-relevant categories from categories.json")
+        except Exception as e:
+            log.warning(f"Failed to load categories.json: {e}")
     else:
-        conf_float = float(raw_conf)
-        conf_str   = f"{conf_float:.1f}%"
+        log.warning(f"categories.json not found at {CATEGORY_FILE}")
 
-    # Status → map to ALERT / OK / NO_CROP
-    hf_status = hf_data.get("status", "")
-    if hf_status in ("healthy", "OK"):
-        status = "OK"
-    elif hf_status == "no_leaf":
-        status = "NO_CROP"
+load_categories()
+
+# ── Download + load ONNX models (cached to disk after first run) ─────────────
+def load_onnx_model(url, local_path, name):
+    if not os.path.exists(local_path):
+        log.info(f"Downloading {name} model from Hugging Face: {url} ...")
+        urllib.request.urlretrieve(url, local_path)
+        log.info(f"{name} model download complete.")
+        cached_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     else:
-        # sick / ALERT / anything else
-        status = "ALERT" if disease.lower() not in ("healthy", "unknown") else "OK"
+        log.info(f"{name} model already cached at {local_path}")
+        cached_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Track cache timestamp
+    if name == "gate":
+        model_cache_state["gate_cached_at"] = cached_at
+    elif name == "disease":
+        model_cache_state["disease_cached_at"] = cached_at
+    
+    return ort.InferenceSession(local_path, providers=["CPUExecutionProvider"])
 
-    return disease, conf_str, status
+log.info("Loading gate model ...")
+gate_session = load_onnx_model(GATE_MODEL_URL, GATE_LOCAL_PATH, "gate")
+log.info("Loading disease model ...")
+disease_session = load_onnx_model(DISEASE_MODEL_URL, DISEASE_LOCAL_PATH, "disease")
+log.info("Both models ready.")
 
-# ── /predict ──────────────────────────────────────────────────────────────────
-@app.route("/predict", methods=["POST"])
-def predict():
-    global latest_reading
+# ── Flask + DB ────────────────────────────────────────────────────────────────
+app = Flask(__name__, static_folder="static", static_url_path="")
+CORS(app)
 
-    if "image" not in request.files:
-        return jsonify({"error": "No image provided"}), 400
 
-    img_bytes   = request.files["image"].read()
-    temperature = parse_float(request.form.get("temperature"))
-    humidity    = parse_float(request.form.get("humidity"))
-    gas         = parse_float(request.form.get("gas_raw"))
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-    pest_risk, pest_reasons = assess_pest_risk(temperature, humidity, gas)
-    img_b64 = "data:image/jpeg;base64," + base64.b64encode(img_bytes).decode()
-    ts      = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    # ── Forward image to HF Space ─────────────────────────────────────────────
-    try:
-        hf_resp = requests.post(
-            HF_SPACE_URL,
-            files={"image": ("capture.jpg", img_bytes, "image/jpeg")},
-            timeout=HF_TIMEOUT,
+def init_db():
+    conn = get_db()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS scans (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename      TEXT NOT NULL,
+            is_leaf       INTEGER,
+            leaf_conf     REAL,
+            label         TEXT,
+            class_id      INTEGER,
+            identified    INTEGER,
+            status        TEXT,
+            severity      TEXT,
+            color         TEXT,
+            confidence    REAL,
+            temperature   REAL,
+            humidity      REAL,
+            gas_raw       TEXT,
+            gas_voltage   TEXT,
+            cultural_biological TEXT,
+            chemical_direct     TEXT,
+            device_time   TEXT,
+            server_time   TEXT,
+            inference_ms  REAL,
+            all_probs     TEXT
         )
-        hf_resp.raise_for_status()
-        hf_data = hf_resp.json()
-        log.info(f"HF Space responded: {hf_data.get('label') or hf_data.get('disease')} "
-                 f"({hf_data.get('confidence')})")
-    except requests.exceptions.Timeout:
-        log.error("HF Space timed out")
-        return jsonify({"error": "Inference service timed out. Try again in a moment."}), 504
-    except requests.exceptions.RequestException as e:
-        log.error(f"HF Space request failed: {e}")
-        return jsonify({"error": f"Inference service unavailable: {str(e)}"}), 502
-    except Exception as e:
-        log.error(f"Unexpected error: {e}")
-        return jsonify({"error": str(e)}), 500
+    """)
+    conn.commit(); conn.close()
 
-    # ── Map HF response to existing format ────────────────────────────────────
-    disease, conf_str, status = map_hf_response(hf_data)
+init_db()
 
-    result = {
-        # ── Exact same keys the ESP32 + dashboard already read ────────────────
-        "disease"      : disease,
-        "confidence"   : conf_str,
-        "status"       : status,
-        "temperature"  : temperature,
-        "humidity"     : humidity,
-        "gas"          : gas,
-        "pest_risk"    : pest_risk,
-        "pest_reasons" : pest_reasons,
-        "timestamp"    : ts,
-        "image"        : img_b64,
-        # ── Extra fields passed through from HF (additive — old clients ignore) ─
-        "advice"       : hf_data.get("advice", ""),
-        "is_leaf"      : hf_data.get("is_leaf", True),
-        "all_probs"    : hf_data.get("all_probs", {}),
+# ── Preprocessing (plain NumPy/PIL, no torch) ─────────────────────────────────
+def bytes_to_input(file_bytes, size):
+    img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+    img = img.resize((size, size))
+    arr = np.array(img).astype(np.float32) / 255.0
+    arr = (arr - IMAGENET_MEAN) / IMAGENET_STD
+    arr = np.transpose(arr, (2, 0, 1))          # HWC -> CHW
+    arr = np.expand_dims(arr, axis=0).astype(np.float32)
+    return arr
+
+def softmax(x):
+    e_x = np.exp(x - np.max(x))
+    return e_x / e_x.sum()
+
+def run_session(session, input_tensor):
+    input_name  = session.get_inputs()[0].name
+    output_name = session.get_outputs()[0].name
+    raw = session.run([output_name], {input_name: input_tensor})[0][0]
+    return softmax(raw)
+
+# ── Diagnosis helpers ─────────────────────────────────────────────────────────
+def resolve_prediction(probabilities):
+    """
+    Runs the full 102-way argmax, but only reports a specific maize pest
+    name if that top prediction is in our maize whitelist (categories.json
+    keys) AND clears MIN_CONFIDENCE. Otherwise falls back to a generic
+    result rather than showing an unrelated crop's pest.
+    """
+    pred_id    = int(np.argmax(probabilities))
+    confidence = round(float(probabilities[pred_id]) * 100, 2)
+    entry      = CATEGORY_MAP.get(str(pred_id))
+
+    if entry and confidence >= MIN_CONFIDENCE:
+        return {
+            "identified": True,
+            "class_id": pred_id,
+            "label": entry["problem"],
+            "confidence": confidence,
+            "cultural_biological": entry["cultural_biological"],
+            "chemical_direct": entry["chemical_direct"],
+        }
+    return {
+        "identified": False,
+        "class_id": pred_id,
+        "label": FALLBACK_LABEL,
+        "confidence": confidence,
+        "cultural_biological": FALLBACK_ADVICE["cultural_biological"],
+        "chemical_direct": FALLBACK_ADVICE["chemical_direct"],
     }
 
-    latest_reading = result
-    history.appendleft(result)
+def classify_severity(confidence, identified):
+    if not identified:
+        return {"status": "unclassified", "severity": "unknown", "color": "orange"}
+    severity = "mild" if confidence < 60 else "severe"
+    color    = "orange" if severity == "mild" else "red"
+    return {"status": "sick", "severity": severity, "color": color}
 
-    log.info(f"Prediction: {disease} ({conf_str}) | "
-             f"T={temperature} H={humidity} Gas={gas} | Pest risk: {pest_risk}")
+def calculate_pest_risk(confidence, identified, temperature, humidity, gas_raw):
+    """
+    Calculate pest risk level based on model confidence and sensor conditions.
+    Returns "HIGH" if conditions favor pest activity, "LOW" otherwise.
+    """
+    pest_reasons = []
+    
+    # Check temperature (optimal for pests: 24-32°C)
+    if temperature is not None:
+        try:
+            t = float(temperature)
+            if 24 <= t <= 32:
+                pest_reasons.append(f"Temperature {t:.1f}°C favors pest activity")
+        except (ValueError, TypeError):
+            pass
+    
+    # Check humidity (optimal for pests: >= 60% RH)
+    if humidity is not None:
+        try:
+            h = float(humidity)
+            if h >= 60:
+                pest_reasons.append(f"Humidity {h:.1f}% supports disease development")
+        except (ValueError, TypeError):
+            pass
+    
+    # Check gas reading (high values may indicate plant stress)
+    if gas_raw is not None:
+        try:
+            g = float(gas_raw)
+            if g >= 1027:
+                pest_reasons.append(f"Gas sensor reading {g:.0f} indicates potential stress")
+        except (ValueError, TypeError):
+            pass
+    
+    # Risk is HIGH if identified AND (temp/humidity/gas conditions are unfavorable)
+    risk = "HIGH" if identified and len(pest_reasons) >= 2 else "LOW"
+    return risk, pest_reasons
 
-    return jsonify(result)
+def transform_response_to_frontend(response, temperature=None, humidity=None, gas_raw=None, gas_voltage=None):
+    """
+    Transform backend response format to frontend expected schema.
+    """
+    transformed = {
+        # Core prediction data
+        "disease": response.get("label", "Unknown"),
+        "label": response.get("label", "Unknown"),
+        "class_id": response.get("class_id"),
+        "identified": response.get("identified", False),
+        "confidence": response.get("confidence", 0),
+        "status": response.get("status", "unknown"),
+        "severity": response.get("severity", "unknown"),
+        "color": response.get("color", "gray"),
+        
+        # Leaf detection
+        "is_leaf": response.get("is_leaf", False),
+        "leaf_confidence": response.get("leaf_confidence", 0),
+        
+        # Pest risk and reasons
+        "pest_risk": "LOW",
+        "pest_reasons": [],
+        
+        # Treatment advice
+        "cultural_biological": response.get("cultural_biological", ""),
+        "chemical_direct": response.get("chemical_direct", ""),
+        
+        # Sensor data (transformed keys to match frontend)
+        "temperature": temperature,
+        "humidity": humidity,
+        "gas": gas_raw,  # Frontend expects "gas", not "gas_raw"
+        "gas_voltage": gas_voltage,
+        
+        # Timestamps and model data
+        "timestamp": response.get("server_timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        "inference_ms": response.get("inference_ms", 0),
+        "all_probs": response.get("all_probs", {}),
+    }
+    
+    # Calculate pest risk based on sensors + confidence
+    try:
+        risk, reasons = calculate_pest_risk(
+            response.get("confidence", 0),
+            response.get("identified", False),
+            temperature,
+            humidity,
+            gas_raw
+        )
+        transformed["pest_risk"] = risk
+        transformed["pest_reasons"] = reasons
+    except Exception as e:
+        log.warning(f"Error calculating pest risk: {e}")
+    
+    return transformed
 
-# ── Original polling routes (all unchanged) ───────────────────────────────────
-@app.route("/latest", methods=["GET"])
-def get_latest():
-    if latest_reading is None:
-        return jsonify({"error": "No readings yet"}), 404
-    return jsonify(latest_reading)
-
-@app.route("/history", methods=["GET"])
-def get_history():
-    return jsonify(list(history))
-
-@app.route("/dashboard", methods=["GET"])
-def dashboard():
-    return send_from_directory("static", "dashboard.html")
-
-@app.route("/health", methods=["GET"])
+# ── Routes ────────────────────────────────────────────────────────────────────
+@app.route("/health")
 def health():
-    return jsonify({"status": "ok", "inference": "hf_space", "url": HF_SPACE_URL})
+    return jsonify({
+        "status": "ok",
+        "models_loaded": gate_session is not None and disease_session is not None,
+        "categories_count": len(CATEGORY_MAP),
+    })
 
-@app.route("/", methods=["GET"])
-def home():
-    return redirect("/dashboard")
+@app.route("/api/categories")
+def api_categories():
+    return jsonify({"success": True, "count": len(CATEGORY_MAP), "categories": CATEGORY_MAP})
 
-# ── Start ─────────────────────────────────────────────────────────────────────
+@app.route("/api/model-status")
+def api_model_status():
+    """Return model caching status for frontend indicator."""
+    cached = model_cache_state["gate_cached_at"] is not None and model_cache_state["disease_cached_at"] is not None
+    return jsonify({
+        "cached": cached,
+        "gate_model_cached_at": model_cache_state["gate_cached_at"],
+        "disease_model_cached_at": model_cache_state["disease_cached_at"],
+    })
+
+@app.route("/predict", methods=["POST"])
+def predict():
+    start = time.time()
+
+    if "image" not in request.files:
+        return jsonify({"error": "No image field in request."}), 400
+    file_bytes  = request.files["image"].read()
+    device_time = request.form.get("captured_at", "").strip()
+    if not file_bytes:
+        return jsonify({"error": "Empty image."}), 400
+    
+    # Extract all 4 sensor fields from ESP32-CAM
+    temperature = request.form.get("temperature")
+    humidity = request.form.get("humidity")
+    gas_raw = request.form.get("gas_raw")
+    gas_voltage = request.form.get("gas_voltage")
+    
+    # Convert to appropriate types for processing
+    try:
+        temperature = float(temperature) if temperature else None
+    except (ValueError, TypeError):
+        temperature = None
+    
+    try:
+        humidity = float(humidity) if humidity else None
+    except (ValueError, TypeError):
+        humidity = None
+
+    try:
+        # ── Stage 1: Gate ─────────────────────────────────────────────────────
+        g_input  = bytes_to_input(file_bytes, GATE_SIZE)
+        g_probs  = run_session(gate_session, g_input)
+        leaf_conf = float(g_probs[1])
+        is_leaf   = leaf_conf >= GATE_THRESH
+
+        if not is_leaf:
+            elapsed = round((time.time() - start) * 1000, 1)
+            log.info(f"Gate rejected (leaf_conf={leaf_conf:.2f}) in {elapsed}ms")
+            raw_response = {
+                "is_leaf":         False,
+                "leaf_confidence": round(leaf_conf * 100, 1),
+                "label":           "No Leaf Detected",
+                "class_id":        None,
+                "identified":      False,
+                "status":          "no_leaf",
+                "severity":        "none",
+                "color":           "gray",
+                "confidence":      round((1 - leaf_conf) * 100, 1),
+                "cultural_biological": "No maize leaf detected. Point the camera directly at the leaf.",
+                "chemical_direct":     "—",
+                "server_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "inference_ms":    elapsed,
+            }
+            # Transform to frontend schema and include sensor data
+            response = transform_response_to_frontend(raw_response, temperature, humidity, gas_raw, gas_voltage)
+            _save_scan(file_bytes, raw_response, device_time, temperature, humidity, gas_raw, gas_voltage)
+            return jsonify(response), 200
+
+        # ── Stage 2: Disease/pest (full 102-way, whitelist-filtered) ──────────
+        d_input  = bytes_to_input(file_bytes, DISEASE_SIZE)
+        d_probs  = run_session(disease_session, d_input)
+        result   = resolve_prediction(d_probs)
+
+        # Only expose probabilities for the maize-relevant classes we actually
+        # display, so the "all probabilities" chart doesn't show 102 bars.
+        all_probs = {
+            CATEGORY_MAP[k]["problem"]: round(float(d_probs[int(k)]) * 100, 2)
+            for k in CATEGORY_MAP
+        }
+
+        diag    = classify_severity(result["confidence"], result["identified"])
+        elapsed = round((time.time() - start) * 1000, 1)
+
+        raw_response = {
+            "is_leaf":          True,
+            "leaf_confidence":  round(leaf_conf * 100, 1),
+            "label":            result["label"],
+            "class_id":         result["class_id"],
+            "identified":       result["identified"],
+            "status":           diag["status"],
+            "severity":         diag["severity"],
+            "color":            diag["color"],
+            "confidence":       result["confidence"],
+            "cultural_biological": result["cultural_biological"],
+            "chemical_direct":     result["chemical_direct"],
+            "all_probs":        all_probs,
+            "server_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "inference_ms":     elapsed,
+        }
+        log.info(f"Predicted: {result['label']} ({result['confidence']}%, "
+                  f"identified={result['identified']}) in {elapsed}ms")
+        
+        # Transform to frontend schema and include sensor data
+        response = transform_response_to_frontend(raw_response, temperature, humidity, gas_raw, gas_voltage)
+        _save_scan(file_bytes, raw_response, device_time, temperature, humidity, gas_raw, gas_voltage)
+        return jsonify(response), 200
+
+    except Exception as e:
+        log.exception("Prediction error")
+        return jsonify({"error": str(e)}), 500
+
+def _save_scan(file_bytes, resp, device_time, temperature=None, humidity=None, gas_raw=None, gas_voltage=None):
+    try:
+        filename = (f"scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                    f"_{uuid.uuid4().hex[:8]}.jpg")
+        with open(os.path.join(UPLOAD_DIR, filename), "wb") as f:
+            f.write(file_bytes)
+        conn = get_db()
+        conn.execute("""
+            INSERT INTO scans
+            (filename, is_leaf, leaf_conf, label, class_id, identified, status,
+             severity, color, confidence, temperature, humidity, gas_raw, gas_voltage,
+             cultural_biological, chemical_direct,
+             device_time, server_time, inference_ms, all_probs)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            filename,
+            1 if resp.get("is_leaf") else 0,
+            resp.get("leaf_confidence"),
+            resp.get("label"),
+            resp.get("class_id"),
+            1 if resp.get("identified") else 0,
+            resp.get("status"),
+            resp.get("severity"),
+            resp.get("color"),
+            resp.get("confidence"),
+            temperature,
+            humidity,
+            gas_raw,
+            gas_voltage,
+            resp.get("cultural_biological"),
+            resp.get("chemical_direct"),
+            device_time,
+            resp.get("server_timestamp"),
+            resp.get("inference_ms"),
+            json.dumps(resp.get("all_probs", {})),
+        ))
+        conn.commit(); conn.close()
+    except Exception:
+        log.exception("Failed to save scan (prediction still returned)")
+
+@app.route("/latest")
+def api_latest():
+    """Return the most recent scan with latest sensor readings."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT * FROM scans ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    
+    if not row:
+        return jsonify({"error": "no scans yet"}), 404
+    
+    item = dict(row)
+    item["image_url"] = f"/uploads/{row['filename']}"
+    try:
+        item["all_probs"] = json.loads(row["all_probs"] or "{}")
+    except Exception:
+        item["all_probs"] = {}
+    
+    # Transform to frontend schema
+    transformed = {
+        "disease": item["label"],
+        "label": item["label"],
+        "class_id": item["class_id"],
+        "identified": bool(item["identified"]),
+        "confidence": item["confidence"],
+        "status": item["status"],
+        "severity": item["severity"],
+        "color": item["color"],
+        "is_leaf": bool(item["is_leaf"]),
+        "leaf_confidence": item["leaf_conf"],
+        "temperature": item["temperature"],
+        "humidity": item["humidity"],
+        "gas": item["gas_raw"],
+        "gas_voltage": item["gas_voltage"],
+        "timestamp": item["server_time"],
+        "inference_ms": item["inference_ms"],
+        "all_probs": item["all_probs"],
+        "cultural_biological": item["cultural_biological"],
+        "chemical_direct": item["chemical_direct"],
+        "image_url": item["image_url"],
+    }
+    
+    # Calculate pest risk
+    risk, reasons = calculate_pest_risk(
+        item["confidence"],
+        bool(item["identified"]),
+        item["temperature"],
+        item["humidity"],
+        item["gas_raw"]
+    )
+    transformed["pest_risk"] = risk
+    transformed["pest_reasons"] = reasons
+    
+    return jsonify(transformed), 200
+
+# ── History API ───────────────────────────────────────────────────────────────
+@app.route("/api/history")
+def api_history():
+    limit  = min(int(request.args.get("limit", 24)), 200)
+    offset = int(request.args.get("offset", 0))
+    status = request.args.get("status", "all")
+
+    conn = get_db()
+    if status in ("sick", "unclassified", "no_leaf"):
+        rows  = conn.execute(
+            "SELECT * FROM scans WHERE status=? ORDER BY id DESC LIMIT ? OFFSET ?",
+            (status, limit, offset)).fetchall()
+        total = conn.execute(
+            "SELECT COUNT(*) FROM scans WHERE status=?", (status,)).fetchone()[0]
+    else:
+        rows  = conn.execute(
+            "SELECT * FROM scans ORDER BY id DESC LIMIT ? OFFSET ?",
+            (limit, offset)).fetchall()
+        total = conn.execute("SELECT COUNT(*) FROM scans").fetchone()[0]
+    conn.close()
+
+    items = []
+    for r in rows:
+        item = dict(r)
+        item["image_url"] = f"/uploads/{r['filename']}"
+        try:
+            item["all_probs"] = json.loads(r["all_probs"] or "{}")
+        except Exception:
+            item["all_probs"] = {}
+        
+        # Transform to frontend schema
+        transformed = {
+            "disease": item["label"],
+            "label": item["label"],
+            "class_id": item["class_id"],
+            "identified": bool(item["identified"]),
+            "confidence": item["confidence"],
+            "status": item["status"],
+            "severity": item["severity"],
+            "color": item["color"],
+            "is_leaf": bool(item["is_leaf"]),
+            "leaf_confidence": item["leaf_conf"],
+            "temperature": item["temperature"],
+            "humidity": item["humidity"],
+            "gas": item["gas_raw"],
+            "gas_voltage": item["gas_voltage"],
+            "timestamp": item["server_time"],
+            "inference_ms": item["inference_ms"],
+            "all_probs": item["all_probs"],
+            "cultural_biological": item["cultural_biological"],
+            "chemical_direct": item["chemical_direct"],
+            "image_url": item["image_url"],
+        }
+        
+        # Calculate pest risk
+        risk, reasons = calculate_pest_risk(
+            item["confidence"],
+            bool(item["identified"]),
+            item["temperature"],
+            item["humidity"],
+            item["gas_raw"]
+        )
+        transformed["pest_risk"] = risk
+        transformed["pest_reasons"] = reasons
+        
+        items.append(transformed)
+
+    return jsonify({"items": items, "total": total,
+                    "limit": limit, "offset": offset})
+
+@app.route("/api/stats")
+def api_stats():
+    conn = get_db()
+    total        = conn.execute("SELECT COUNT(*) FROM scans").fetchone()[0]
+    sick         = conn.execute("SELECT COUNT(*) FROM scans WHERE status='sick'").fetchone()[0]
+    unclassified = conn.execute("SELECT COUNT(*) FROM scans WHERE status='unclassified'").fetchone()[0]
+    no_leaf      = conn.execute("SELECT COUNT(*) FROM scans WHERE status='no_leaf'").fetchone()[0]
+    last    = conn.execute(
+        "SELECT COALESCE(device_time, server_time) FROM scans ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    avg_c   = conn.execute(
+        "SELECT AVG(confidence) FROM scans WHERE is_leaf=1"
+    ).fetchone()[0]
+    conn.close()
+    return jsonify({
+        "total":              total,
+        "sick":               sick,
+        "unclassified":       unclassified,
+        "no_leaf":            no_leaf,
+        "sick_pct":           round(sick / total * 100, 1) if total else 0,
+        "unclassified_pct":   round(unclassified / total * 100, 1) if total else 0,
+        "avg_confidence":     round(avg_c, 1) if avg_c else 0,
+        "last_scan_time":     last[0] if last else None,
+    })
+
+@app.route("/uploads/<path:filename>")
+def serve_upload(filename):
+    return send_from_directory(UPLOAD_DIR, filename)
+
+@app.route("/")
+def serve_dashboard():
+    return send_from_directory(app.static_folder, "index.html")
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host=HOST, port=PORT, threaded=False, debug=True)
