@@ -48,7 +48,7 @@ DB_PATH    = os.path.join(BASE_DIR, "scans.db")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(os.path.join(BASE_DIR, "models"), exist_ok=True)
 
-GATE_SIZE      = 160
+GATE_SIZE      = 224
 DISEASE_SIZE   = 224
 GATE_THRESH    = 0.60    # leaf confidence threshold (0.0 - 1.0)
 MIN_CONFIDENCE = 55.0    # percentage threshold (0.0 - 100.0)
