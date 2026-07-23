@@ -1,0 +1,57 @@
+{
+  "14": {
+    "problem": "grub",
+    "cultural_biological": "Deep plow the soil during autumn or winter to expose grubs to birds and cold weather.",
+    "chemical_direct": "Apply Metarhizium anisopliae bio-insecticide or mix Chlorpyrifos granules into the soil."
+  },
+  "15": {
+    "problem": "mole cricket",
+    "cultural_biological": "Flood fields to force crickets to the surface for manual collection or bird predation.",
+    "chemical_direct": "Deploy toxic baits mixed with Trichlorfon or apply Imidacloprid into tunnels."
+  },
+  "16": {
+    "problem": "wireworm",
+    "cultural_biological": "Implement intensive crop rotation with non-host plants and optimize summer fallow tilling.",
+    "chemical_direct": "Use Bifenthrin or Clothianidin as a seed coat or pre-planting soil treatment."
+  },
+  "17": {
+    "problem": "white margined moth",
+    "cultural_biological": "Deploy light traps to catch adult moths and manually crush egg clusters.",
+    "chemical_direct": "Spray Lambda-Cyhalothrin or Chlorantraniliprole during larval outbreaks."
+  },
+  "18": {
+    "problem": "black cutworm",
+    "cultural_biological": "Remove weeds 10-14 days before planting to starve young larvae.",
+    "chemical_direct": "Apply synthetic pyrethroid sprays (e.g., Deltamethrin) or bran baits late in the evening."
+  },
+  "19": {
+    "problem": "large cutworm",
+    "cultural_biological": "Utilize physical barriers around high-value seedlings and implement deep mechanical tilling.",
+    "chemical_direct": "Apply targeted applications of Indoxacarb or Chlorfenapyr to the base of plants."
+  },
+  "20": {
+    "problem": "yellow cutworm",
+    "cultural_biological": "Keep field boundaries completely clean of host weeds; utilize structural row covers.",
+    "chemical_direct": "Deploy molasses-pesticide baits or spray Emamectin Benzoate around affected clusters."
+  },
+  "21": {
+    "problem": "red spider",
+    "cultural_biological": "Introduce predatory mites (Phytoseiidae) and maintain overhead sprinkler irrigation to wash them away.",
+    "chemical_direct": "Spray specific acaricides like Abamectin, Spirodiclofen, or Hexythiazox."
+  },
+  "22": {
+    "problem": "corn borer",
+    "cultural_biological": "Plant resistant hybrids and release Trichogramma ostriniae wasps at initial egg laying.",
+    "chemical_direct": "Apply Bacillus thuringiensis (Bt) granules or spray Chlorantraniliprole into the whorls."
+  },
+  "23": {
+    "problem": "army worm",
+    "cultural_biological": "Dig deep defensive trenches around fields to stop migrating crawls; protect bird populations.",
+    "chemical_direct": "Spray Methomyl, Flubendiamide, or Spinosad evenly across the crop canopy."
+  },
+  "24": {
+    "problem": "aphids",
+    "cultural_biological": "Conserve ladybug beetles and lacewings; blast small infestations with high-pressure water.",
+    "chemical_direct": "Apply Imidacloprid, Thiamethoxam, or Flonicamid systemic sprays."
+  }
+}
