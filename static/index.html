@@ -137,7 +137,7 @@
     <div class="config-row">
       <div class="field-block">
         <span class="field-label">Server base URL (no trailing slash)</span>
-        <input type="text" id="apiBase" placeholder="https://crop-disease-detection-b4ze.onrender.com" value="https://crop-pest-detection.onrender.com">
+        <input type="text" id="apiBase" placeholder="https://crop-disease-detection-b4ze.onrender.com" value="https://crop-disease-detection-b4ze.onrender.com">
       </div>
     </div>
   </div>
@@ -400,7 +400,7 @@
       const res = await fetch(base + '/api/history');
       if (!res.ok) return;
       const data = await res.json();
-      if (Array.isArray(data) && data.length) { clientHistory = data; renderHistory(clientHistory); }
+      if (data.items && Array.isArray(data.items) && data.items.length) { clientHistory = data.items; renderHistory(clientHistory); }
     } catch (err) { }
   }
 
