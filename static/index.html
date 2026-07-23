@@ -81,6 +81,9 @@
   .ribbon{display:inline-flex;align-items:center;gap:6px;font-family:'IBM Plex Mono',monospace;font-size:11px;font-weight:500;letter-spacing:0.04em;padding:4px 10px;border-radius:20px;background:var(--leaf);color:#fff;width:fit-content;margin-top:12px;}
   .specimen.status-alert .ribbon{background:var(--rust);}
   .specimen .empty{color:var(--soil-soft);font-size:13px;}
+  .specimen .advice-section{margin-top:16px;padding-top:12px;border-top:1px solid var(--line);}
+  .specimen .advice-label{font-family:'IBM Plex Mono',monospace;font-size:10px;text-transform:uppercase;letter-spacing:0.05em;color:var(--soil-soft);margin-bottom:4px;}
+  .specimen .advice-text{font-size:11px;line-height:1.4;color:var(--soil-soft);margin-bottom:8px;}
 
   button.scan-btn{width:100%;padding:12px;border:none;border-radius:8px;background:var(--soil);color:#fff;font-family:'Inter',sans-serif;font-weight:600;font-size:14px;cursor:pointer;}
   button.scan-btn:disabled{background:var(--line-strong);color:var(--soil-soft);cursor:not-allowed;}
@@ -355,11 +358,27 @@
   function renderSpecimen(data) {
     const isAlert = data.status === 'sick';
     specimen.className = 'specimen' + (isAlert ? ' status-alert' : '');
+    
+    let adviceSection = '';
+    if (data.cultural_biological || data.chemical_direct) {
+      adviceSection = '<div class="advice-section">';
+      if (data.cultural_biological) {
+        adviceSection += '<div class="advice-label">Cultural & Biological</div>';
+        adviceSection += '<div class="advice-text">' + data.cultural_biological + '</div>';
+      }
+      if (data.chemical_direct) {
+        adviceSection += '<div class="advice-label">Chemical Direct</div>';
+        adviceSection += '<div class="advice-text">' + data.chemical_direct + '</div>';
+      }
+      adviceSection += '</div>';
+    }
+    
     specimen.innerHTML =
       '<span class="eyebrow">Prediction</span>' +
       '<p class="disease-name">' + formatName(data.disease) + '</p>' +
       '<p class="confidence">Confidence <b>' + data.confidence + '</b></p>' +
-      '<span class="ribbon">' + (isAlert ? 'Alert — treat crop' : 'Healthy leaf') + '</span>';
+      '<span class="ribbon">' + (isAlert ? 'Alert — treat crop' : 'Healthy leaf') + '</span>' +
+      adviceSection;
   }
 
   function renderSensors(data) {
