@@ -58,7 +58,7 @@ GATE_LEAF_INDEX = 0
 # Set COLOR_MODE to "BGR" if the gate model was trained using OpenCV/Albumentations defaults
 COLOR_MODE      = "BGR"    # "RGB" or "BGR"
 
-MIN_CONFIDENCE  = 40.0
+MIN_CONFIDENCE  = 0.0
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
